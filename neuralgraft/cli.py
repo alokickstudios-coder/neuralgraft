@@ -384,6 +384,61 @@ def cmd_full(args):
     return result
 
 
+def cmd_forge(args):
+    """Construct a LoRA from images without training."""
+    from .forge import LoRAForge
+
+    base = Path(args.base)
+    image_dir = Path(args.images)
+    output = Path(args.output)
+    device = args.device or _default_device()
+
+    _banner("NeuralGraft -- LoRA Forge (Zero-Training LoRA Construction)", {
+        "Base model": base.name,
+        "Dataset": str(image_dir),
+        "Output": output.name,
+        "Rank": str(args.rank),
+        "Strength": f"{args.strength}x",
+        "Device": device,
+        "Vision model": "DINOv2" if args.use_vision_model else "OpenCV (lightweight)",
+    })
+
+    t0 = time.time()
+
+    forge = LoRAForge(
+        rank=args.rank,
+        strength=args.strength,
+        min_r_squared=args.min_r2,
+        use_vision_model=args.use_vision_model,
+    )
+
+    result = forge.forge(
+        model_path=base,
+        image_dir=image_dir,
+        output_path=output,
+        max_images=args.max_images,
+        device=device,
+        trigger_word=args.trigger_word,
+    )
+
+    dt = time.time() - t0
+
+    if result is None:
+        logger.error("Forge failed -- no concept signal found in dataset")
+        raise SystemExit(1)
+
+    _banner("Forge Complete", {
+        "Time": f"{dt:.1f}s ({dt/60:.1f} min)",
+        "Output": str(result),
+        "Size": f"{result.stat().st_size / 1e6:.1f} MB",
+    })
+
+    if args.trigger_word:
+        print(f"\n  Use trigger word '{args.trigger_word}' in your prompts to activate the LoRA.\n")
+
+    return result
+
+
 # -----------------------------------------------------------------------
 # Argument parser
 # -----------------------------------------------------------------------
@@ -427,6 +482,30 @@ def main():
         p.add_argument("--loras", nargs="+", default=None,
                         help="LoRA files as path:strength (e.g. lora.safetensors:0.6)")
 
+    # Forge command (separate args)
+    p_forge = sub.add_parser("forge",
+        help="Construct a LoRA from images WITHOUT training (activation regression)")
+    p_forge.add_argument("--base", type=str, required=True,
+                         help="Path to base model checkpoint (safetensors)")
+    p_forge.add_argument("--images", type=str, required=True,
+                         help="Directory containing dataset images (10-100 recommended)")
+    p_forge.add_argument("--output", "-o", type=str, default="forged-lora.safetensors",
+                         help="Output LoRA path (default: forged-lora.safetensors)")
+    p_forge.add_argument("--rank", type=int, default=16,
+                         help="LoRA rank (default: 16)")
+    p_forge.add_argument("--strength", type=float, default=1.0,
+                         help="LoRA strength multiplier (default: 1.0)")
+    p_forge.add_argument("--trigger-word", type=str, default=None,
+                         help="Trigger word for the concept (e.g. 'mystyle')")
+    p_forge.add_argument("--max-images", type=int, default=100,
+                         help="Maximum images to use (default: 100)")
+    p_forge.add_argument("--device", default=None,
+                         help="Torch device for vision model (default: auto-detect)")
+    p_forge.add_argument("--use-vision-model", action="store_true", default=False,
+                         help="Use DINOv2 for richer features (requires internet on first run)")
+    p_forge.add_argument("--min-r2", type=float, default=0.01,
+                         help="Minimum R^2 to include a layer (default: 0.01)")
+
     # List codecs
     sub.add_parser("list", help="List available codecs")
 
@@ -444,6 +523,10 @@ def main():
             codec = get_codec(name, device="cpu")
             print(f"  {name:22s}  {codec.description}")
         print()
+        return
+
+    if args.command == "forge":
+        cmd_forge(args)
         return
 
     commands = {

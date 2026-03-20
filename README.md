@@ -1,11 +1,12 @@
 <p align="center">
   <h1 align="center">NeuralGraft</h1>
-  <p align="center"><strong>Zero-Training Capability Transfer for Diffusion Models</strong></p>
-  <p align="center"><em>Hours of model training in minutes. Graft anything into any model.</em></p>
+  <p align="center"><strong>Zero-Training Capability Transfer & LoRA Construction for Diffusion Models</strong></p>
+  <p align="center"><em>Hours of model training in minutes. Graft anything. Forge LoRAs from images. No training loop.</em></p>
 </p>
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> &bull;
+  <a href="#lora-forge">LoRA Forge</a> &bull;
   <a href="#how-it-works">How It Works</a> &bull;
   <a href="#proof-of-concept">Proof of Concept</a> &bull;
   <a href="RESEARCH.md">Research Paper</a> &bull;
@@ -14,21 +15,26 @@
 
 ---
 
-**I vibe-coded this tool to avoid hours of model training and it worked.** Hours of serious model training with community LoRAs on consumer GPUs became minutes of business. What used to take 4+ hours of gradient descent, carefully tuned learning rates, and praying your loss curve doesn't explode -- NeuralGraft does in ~12 minutes with pure linear algebra. No training loop. No optimizer. No loss function. Just SVD and closed-form regression.
+**I vibe-coded this tool to avoid hours of model training and it worked.** Hours of serious model training with community LoRAs on consumer GPUs became minutes of business. What used to take 4+ hours of gradient descent, carefully tuned learning rates, and praying your loss curve doesn't explode -- NeuralGraft does in minutes with pure linear algebra. No training loop. No optimizer. No loss function. Just SVD and closed-form regression.
 
 The core insight: **you don't need to train a model to teach it something new.** You just need to know *where* in the model a capability lives and *how much* to turn it up. NeuralGraft discovers both automatically.
+
+**NEW: LoRA Forge** -- Give NeuralGraft a folder of images and it constructs a LoRA *without any training*. No gradient descent, no loss curves, no hyperparameter tuning. It extracts a "concept signature" from your images and finds which model weight directions encode that concept, then outputs a standard LoRA file you can use anywhere. Dataset in, LoRA out, minutes not hours.
 
 ## What Can NeuralGraft Do?
 
 | Operation | What It Does | Time |
 |-----------|-------------|------|
+| **LoRA Forge** | Construct a LoRA from images -- no training | ~1-5 min |
 | **LoRA Baking** | Permanently merge any LoRA into base weights | ~5 min |
 | **Spectral Steering** | Graft quality capabilities from reference clips | ~10 min |
 | **LoRA Amplification** | Boost LoRA-improved dimensions in base weights | ~3 min |
 | **Cross-Architecture Transfer** | Graft capabilities from Model A into Model B | ~12 min |
 | **Full Pipeline** | Bake + Amplify in one pass | ~12 min |
 
-**The headline feature:** You can graft capabilities from a completely different model architecture into your model. Different layer counts, different attention patterns, different everything. NeuralGraft doesn't care -- it works through capability scoring, not weight copying.
+**Two headline features:**
+1. **LoRA Forge** -- Drop a folder of images, get a LoRA. No training. Works with any DiT model.
+2. **Cross-Architecture Transfer** -- Graft capabilities from any model into any other model. Different architectures, different everything. NeuralGraft doesn't care.
 
 ## Quickstart
 
@@ -56,6 +62,14 @@ pip install -e .
 ### CLI Usage
 
 ```bash
+# NEW: Forge a LoRA from images (no training!)
+neuralgraft forge \
+  --base model.safetensors \
+  --images ./my_dataset/ \
+  --output my-style-lora.safetensors \
+  --rank 16 \
+  --trigger-word "mystyle"
+
 # Bake a LoRA permanently into model weights
 neuralgraft bake \
   --base model.safetensors \
@@ -81,6 +95,10 @@ neuralgraft full \
   --output final-model.safetensors \
   --loras my-lora.safetensors:0.5
 
+# Forge + bake in sequence (create LoRA, then permanently merge it)
+neuralgraft forge --base model.safetensors --images ./dataset/ -o style.safetensors
+neuralgraft bake --base model.safetensors --loras style.safetensors:0.7 -o enhanced.safetensors
+
 # List available quality codecs
 neuralgraft list
 ```
@@ -88,7 +106,7 @@ neuralgraft list
 ### Python API
 
 ```python
-from neuralgraft import WeightSurgeon, ActivationHarvester, CapabilityProber
+from neuralgraft import WeightSurgeon, ActivationHarvester, CapabilityProber, LoRAForge
 from neuralgraft.codecs import get_codec
 from pathlib import Path
 
@@ -148,6 +166,62 @@ class MyCodec(BaseCodec):
 ```
 
 That's it. NeuralGraft handles harvesting, probing, and spectral steering automatically.
+
+## LoRA Forge
+
+**The breakthrough:** You can now create LoRAs from a folder of images without any training at all.
+
+```bash
+# Give it 10-100 images of a style/concept you want to capture
+neuralgraft forge \
+  --base model.safetensors \
+  --images ./my_cinematic_shots/ \
+  --output cinematic-lora.safetensors \
+  --rank 16 \
+  --trigger-word "cinematic"
+```
+
+**How it works:**
+1. Extracts a multi-dimensional "concept signature" from your images (color palette, texture, spatial frequency, contrast, structure -- 81 visual features per image)
+2. Loads the DiT checkpoint and projects your images through each transformer block's weights
+3. Regresses: *which activation directions predict your concept signature?*
+4. Constructs standard LoRA matrices (B @ A) from those directions via SVD
+5. Saves as a standard `.safetensors` LoRA compatible with ComfyUI, diffusers, etc.
+
+**What it's great for:**
+- Art style transfer (give it 20 frames from a film, get its visual style as a LoRA)
+- Color grading (give it color-graded reference images)
+- Texture/material quality (skin texture, fabric, surfaces)
+- Lighting mood (warm sunset, cold blue, neon)
+- Camera characteristics (specific lens look, depth of field style)
+
+**What it struggles with (honest limitations):**
+- Specific face identity (faces are highly non-linear -- use DreamBooth/LoRA training for faces)
+- Very fine character details (specific clothing patterns, logos)
+- Concepts the base model has never seen at all
+
+**For better quality**, add `--use-vision-model` to use DINOv2 (384-dim features instead of 81-dim OpenCV features):
+
+```bash
+neuralgraft forge \
+  --base model.safetensors \
+  --images ./dataset/ \
+  --output better-lora.safetensors \
+  --use-vision-model
+```
+
+```python
+# Python API
+from neuralgraft import LoRAForge
+
+forge = LoRAForge(rank=16, strength=1.0)
+forge.forge(
+    model_path="model.safetensors",
+    image_dir="./my_images/",
+    output_path="my-lora.safetensors",
+    trigger_word="mystyle",
+)
+```
 
 ## How It Works
 

@@ -34,10 +34,12 @@ __email__ = "Alokickstudios@gmail.com"
 from .prober import CapabilityDirection, CapabilityProber
 from .surgeon import WeightSurgeon
 from .harvester import ActivationHarvester
+from .forge import LoRAForge
 
 __all__ = [
     "CapabilityDirection",
     "CapabilityProber",
     "WeightSurgeon",
     "ActivationHarvester",
+    "LoRAForge",
 ]
