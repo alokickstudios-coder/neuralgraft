@@ -306,6 +306,23 @@ The FP8 round-trip introduces minimal quantization noise (3-bit mantissa), but t
 
 ## Proof of Concept
 
+### Test Case: LoRA Forge on LTX 2.3 22B (Real Model, Real Data)
+
+**Setup:** LTX 2.3 22B Distilled (FP8, 23.5 GB) on CPU only. Two datasets extracted from real production reference footage.
+
+| | DramaBox LoRA | Scandal LoRA |
+|---|---|---|
+| **Dataset** | 24 cinematic frames (warm) | 8 dramatic frames (dark) |
+| **Forge time** | **39 seconds** | **35 seconds** |
+| **Layers with signal** | 48/48 (100%) | 48/48 (100%) |
+| **Parameters** | 6.3M | 6.3M |
+| **File size** | 12.6 MB | 12.6 MB |
+| **Weight difference between LoRAs** | **141.7%** | (vs DramaBox) |
+
+Two visually distinct datasets produced **141.7% different LoRA weights** in ~35 seconds each. No gradient descent. No GPU. No training loop. Pure SVD regression on the actual 22B production model.
+
+See [docs/proof_of_concept/RESULTS.md](docs/proof_of_concept/RESULTS.md) for full details.
+
 ### Test Case: Grafting Temporal Consistency into LTX 2.3
 
 **Problem:** LTX 2.3 22B produces sharp individual frames but has temporal flickering (SSIM consistency 0.33-0.54 between frames).
