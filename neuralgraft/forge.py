@@ -281,9 +281,13 @@ class LoRAForge:
         output_path = Path(output_path)
 
         if target_suffixes is None:
+            # Target ALL attention + feedforward layers (matches ComfyUI LoRA format)
             target_suffixes = [
-                "attn1.to_out.0.weight", "attn2.to_out.0.weight",
-                "attn.to_out.0.weight", "ff.net.2.weight",
+                "attn1.to_q.weight", "attn1.to_k.weight",
+                "attn1.to_v.weight", "attn1.to_out.0.weight",
+                "attn2.to_q.weight", "attn2.to_k.weight",
+                "attn2.to_v.weight", "attn2.to_out.0.weight",
+                "ff.net.0.proj.weight", "ff.net.2.weight",
             ]
 
         t0 = time.time()
@@ -359,125 +363,104 @@ class LoRAForge:
         for block_name in layer_names:
             weights = block_weights.get(block_name, {})
 
-            # Find output projection weight
-            out_key = None
-            for k in weights:
-                if any(k.endswith(p) for p in target_suffixes) and weights[k].dim() == 2:
-                    out_key = k
-                    break
+            # Process ALL matching weight matrices in this block
+            target_keys = [
+                k for k in weights
+                if any(k.endswith(p) for p in target_suffixes) and weights[k].dim() == 2
+            ]
 
-            if out_key is None:
+            if not target_keys:
                 continue
 
-            W_raw = weights[out_key]
-            if W_raw.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                W = W_raw.to(torch.bfloat16).float()
-                scale_key = out_key.replace(".weight", ".weight_scale")
-                if scale_key in weights:
-                    W = W * weights[scale_key].float()
-            else:
-                W = W_raw.float()
+            block_had_signal = False
 
-            if W.dim() != 2:
-                continue
+            for out_key in target_keys:
 
-            d_out, d_in = W.shape
+                W_raw = weights[out_key]
+                if W_raw.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    W = W_raw.to(torch.bfloat16).float()
+                    scale_key = out_key.replace(".weight", ".weight_scale")
+                    if scale_key in weights:
+                        W = W * weights[scale_key].float()
+                else:
+                    W = W_raw.float()
 
-            # Create activation proxy: project image content through W
-            if d_in not in proj_cache:
-                gen = torch.Generator().manual_seed(42 + d_in)
-                proj = torch.randn(frame_dim, d_in, generator=gen)
-                proj = proj / (proj.norm(dim=0, keepdim=True) + 1e-8)
-                proj_cache[d_in] = proj
-
-            X_content = image_flat @ proj_cache[d_in]  # [N, d_in]
-            H = X_content @ W.T  # [N, d_out] — activation proxy
-
-            # ── Multi-target regression: concept_features ≈ H @ Beta ────
-            # Beta: [d_out, d_feat] — maps activations to concept features
-            # Solve via SVD pseudoinverse of H
-            try:
-                U_H, S_H, Vt_H = torch.linalg.svd(H, full_matrices=False)
-                k = min(self.rank, len(S_H), N_images, d_out)
-                S_inv = torch.zeros_like(S_H)
-                S_inv[:k] = 1.0 / (S_H[:k] + 1e-8)
-
-                # Beta = pinv(H) @ concept_features = Vt^T @ S^{-1} @ U^T @ F
-                Beta = Vt_H.T @ torch.diag(S_inv) @ U_H.T @ concept_features  # [d_out, d_feat]
-
-                # Compute R^2 per feature dimension, take mean
-                F_pred = H @ Beta
-                ss_res = ((concept_features - F_pred) ** 2).sum(0)
-                ss_tot = ((concept_features - concept_features.mean(0)) ** 2).sum(0)
-                r2_per_feat = 1.0 - (ss_res / (ss_tot + 1e-8))
-                r2_mean = float(r2_per_feat.clamp(min=0).mean())
-
-                if r2_mean < self.min_r2:
+                if W.dim() != 2:
                     continue
 
+                d_out, d_in = W.shape
+
+                # Create activation proxy: project image content through W
+                if d_in not in proj_cache:
+                    gen = torch.Generator().manual_seed(42 + d_in)
+                    proj = torch.randn(frame_dim, d_in, generator=gen)
+                    proj = proj / (proj.norm(dim=0, keepdim=True) + 1e-8)
+                    proj_cache[d_in] = proj
+
+                X_content = image_flat @ proj_cache[d_in]  # [N, d_in]
+                H = X_content @ W.T  # [N, d_out] — activation proxy
+
+                # ── Multi-target regression: concept_features ≈ H @ Beta ──
+                try:
+                    U_H, S_H, Vt_H = torch.linalg.svd(H, full_matrices=False)
+                    k = min(self.rank, len(S_H), N_images, d_out)
+                    S_inv = torch.zeros_like(S_H)
+                    S_inv[:k] = 1.0 / (S_H[:k] + 1e-8)
+
+                    Beta = Vt_H.T @ torch.diag(S_inv) @ U_H.T @ concept_features
+
+                    F_pred = H @ Beta
+                    ss_res = ((concept_features - F_pred) ** 2).sum(0)
+                    ss_tot = ((concept_features - concept_features.mean(0)) ** 2).sum(0)
+                    r2_per_feat = 1.0 - (ss_res / (ss_tot + 1e-8))
+                    r2_mean = float(r2_per_feat.clamp(min=0).mean())
+
+                    if r2_mean < self.min_r2:
+                        continue
+
+                    block_had_signal = True
+
+                except Exception as e:
+                    logger.warning(f"  Regression failed for {out_key}: {e}")
+                    continue
+
+                # ── Construct LoRA (B, A) from regression directions ──
+                try:
+                    U_beta, S_beta, _ = torch.linalg.svd(Beta, full_matrices=False)
+                except Exception:
+                    continue
+
+                r = min(self.rank, len(S_beta), d_out, d_in)
+
+                out_dirs = U_beta[:, :r]  # [d_out, r]
+                in_dirs = W.T @ out_dirs   # [d_in, r]
+                in_norms = in_dirs.norm(dim=0, keepdim=True) + 1e-8
+                in_dirs = in_dirs / in_norms
+
+                scale = torch.sqrt(S_beta[:r].clamp(min=0) * self.strength * r2_mean)
+
+                B = out_dirs * scale.unsqueeze(0)   # [d_out, r]
+                A = (in_dirs * scale.unsqueeze(0)).T  # [r, d_in]
+
+                # Safety: clamp to prevent extreme LoRA values
+                B = B.clamp(-1.0, 1.0)
+                A = A.clamp(-1.0, 1.0)
+
+                # ── Convert key format: model weight key → LoRA key ──
+                # ComfyUI expects: diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight
+                lora_base = out_key.replace(".weight", "")
+                if lora_base.startswith("model.") and not lora_base.startswith("model.diffusion_model."):
+                    lora_base = lora_base[len("model."):]
+                if not lora_base.startswith("diffusion_model."):
+                    lora_base = "diffusion_model." + lora_base
+
+                lora_state_dict[f"{lora_base}.lora_A.weight"] = A.to(torch.bfloat16).contiguous()
+                lora_state_dict[f"{lora_base}.lora_B.weight"] = B.to(torch.bfloat16).contiguous()
+
+                del H, Beta, U_H, S_H, Vt_H, U_beta, S_beta, B, A
+
+            if block_had_signal:
                 layers_with_signal += 1
-
-            except Exception as e:
-                logger.warning(f"  Regression failed for {block_name}: {e}")
-                continue
-
-            # ── Phase 4: Construct LoRA (B, A) from regression directions ──
-            #
-            # Beta columns are directions in d_out space that predict concept features.
-            # SVD of Beta gives us the principal "concept directions":
-            #   Beta = U_beta @ S_beta @ Vt_beta
-            #   Top-r directions: U_beta[:, :r] (output directions)
-            #
-            # For the input side of the LoRA:
-            #   input_dir = W^T @ output_dir (what input activates this output)
-            #   Normalized and scaled by regression strength
-            #
-            # Final LoRA:
-            #   B = U_beta[:, :r] @ diag(sqrt(S_beta[:r] * strength))
-            #   A = diag(sqrt(S_beta[:r] * strength)) @ (W^T @ U_beta[:, :r])^T normalized
-
-            try:
-                U_beta, S_beta, _ = torch.linalg.svd(Beta, full_matrices=False)
-            except Exception:
-                continue
-
-            r = min(self.rank, len(S_beta), d_out, d_in)
-
-            # Output directions (in d_out space)
-            out_dirs = U_beta[:, :r]  # [d_out, r]
-
-            # Input directions (project output dirs back through W)
-            in_dirs = W.T @ out_dirs   # [d_in, r]
-            in_norms = in_dirs.norm(dim=0, keepdim=True) + 1e-8
-            in_dirs = in_dirs / in_norms  # normalize each column
-
-            # Scale by singular values and strength
-            # S_beta encodes how much each direction explains concept variance
-            scale = torch.sqrt(S_beta[:r].clamp(min=0) * self.strength * r2_mean)
-
-            B = out_dirs * scale.unsqueeze(0)   # [d_out, r]
-            A = (in_dirs * scale.unsqueeze(0)).T  # [r, d_in]
-
-            # Safety: clamp to prevent extreme LoRA values
-            max_val = 1.0
-            B = B.clamp(-max_val, max_val)
-            A = A.clamp(-max_val, max_val)
-
-            # ── Convert key format: model weight key → LoRA key ──
-            # ComfyUI expects: "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_A.weight"
-            # Strip only "model." prefix but KEEP "diffusion_model." prefix.
-            # If no prefix exists, ADD "diffusion_model." for ComfyUI compatibility.
-            lora_base = out_key.replace(".weight", "")
-            if lora_base.startswith("model.") and not lora_base.startswith("model.diffusion_model."):
-                lora_base = lora_base[len("model."):]
-            if not lora_base.startswith("diffusion_model."):
-                lora_base = "diffusion_model." + lora_base
-
-            lora_state_dict[f"{lora_base}.lora_A.weight"] = A.to(torch.float16).contiguous()
-            lora_state_dict[f"{lora_base}.lora_B.weight"] = B.to(torch.float16).contiguous()
-            lora_state_dict[f"{lora_base}.alpha"] = torch.tensor(float(r))
-
-            del H, Beta, U_H, S_H, Vt_H, U_beta, S_beta, B, A
 
         del proj_cache, image_flat
         gc.collect()
