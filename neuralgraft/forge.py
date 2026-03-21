@@ -211,6 +211,163 @@ def _extract_concept_signature_with_model(
         return _extract_concept_signature(images)
 
 
+def _extract_character_signature(images: List[np.ndarray]) -> torch.Tensor:
+    """
+    Extract identity-focused features for character LoRAs.
+
+    Uses InsightFace/ArcFace (512-dim identity embedding) if available,
+    with OpenCV face-crop features as fallback.
+
+    The key difference from style signatures: these features encode WHO
+    is in the image (facial geometry, skin tone, face structure) rather
+    than how the image looks stylistically.
+
+    Returns: [N_images, d_features] feature matrix
+    """
+    # ── Try InsightFace (gold standard for identity) ──
+    try:
+        from insightface.app import FaceAnalysis
+
+        app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        app.prepare(ctx_id=-1, det_size=(640, 640))
+
+        embeddings = []
+        skipped = 0
+        for img in images:
+            faces = app.get(img)
+            if faces:
+                # Use the largest face (most prominent)
+                largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                embeddings.append(torch.from_numpy(largest.embedding).float())
+            else:
+                skipped += 1
+
+        del app
+
+        if len(embeddings) >= 3:
+            if skipped > 0:
+                logger.info(f"  InsightFace: {len(embeddings)} faces detected, {skipped} images had no face")
+            else:
+                logger.info(f"  InsightFace: {len(embeddings)} face embeddings (512-dim)")
+            return torch.stack(embeddings)
+        else:
+            logger.info(f"  InsightFace: only {len(embeddings)} faces found, falling back to OpenCV")
+
+    except ImportError:
+        logger.info("  InsightFace not installed, using OpenCV face features")
+    except Exception as e:
+        logger.info(f"  InsightFace failed ({e}), using OpenCV face features")
+
+    # ── Fallback: OpenCV face-crop features ──
+    # Detect faces, crop, extract identity-focused features from the face region
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    all_features = []
+    for img in images:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
+
+        if len(faces) == 0:
+            # Use center crop as face proxy (portrait assumption)
+            h, w = img.shape[:2]
+            cx, cy = w // 2, h // 3  # Face is typically in upper third
+            sz = min(h, w) // 3
+            x1 = max(0, cx - sz)
+            y1 = max(0, cy - sz)
+            x2 = min(w, cx + sz)
+            y2 = min(h, cy + sz)
+        else:
+            # Largest face
+            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            # Expand bbox by 30% for context (hair, jawline)
+            pad_x, pad_y = int(fw * 0.3), int(fh * 0.3)
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(img.shape[1], x + fw + pad_x)
+            y2 = min(img.shape[0], y + fh + pad_y)
+
+        face_crop = img[y1:y2, x1:x2]
+        if face_crop.size == 0:
+            continue
+
+        face_crop = cv2.resize(face_crop, (112, 112))
+        features = []
+
+        # Skin tone: HSV histogram of face (captures skin color precisely)
+        hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
+        h_hist = cv2.calcHist([hsv], [0], None, [36], [0, 180]).flatten()
+        s_hist = cv2.calcHist([hsv], [1], None, [24], [0, 256]).flatten()
+        v_hist = cv2.calcHist([hsv], [2], None, [24], [0, 256]).flatten()
+        h_hist = h_hist / (h_hist.sum() + 1e-8)
+        s_hist = s_hist / (s_hist.sum() + 1e-8)
+        v_hist = v_hist / (v_hist.sum() + 1e-8)
+        features.extend(h_hist.tolist())  # 36
+        features.extend(s_hist.tolist())  # 24
+        features.extend(v_hist.tolist())  # 24
+
+        # Face structure: edge map captures jawline, eye shape, nose bridge
+        face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        edges = cv2.Canny(face_gray.astype(np.uint8), 50, 150)
+        # Divide face into 7x7 grid, compute edge density per cell
+        cell_h, cell_w = 112 // 7, 112 // 7
+        for gy in range(7):
+            for gx in range(7):
+                cell = edges[gy*cell_h:(gy+1)*cell_h, gx*cell_w:(gx+1)*cell_w]
+                features.append(np.count_nonzero(cell) / cell.size)  # 49
+
+        # Face texture: LBP-like local patterns (skin texture, wrinkles, pores)
+        face_u8 = face_gray.clip(0, 255).astype(np.uint8)
+        # Compute gradient magnitude in 4x4 patches
+        gx = cv2.Sobel(face_u8, cv2.CV_32F, 1, 0, ksize=3)
+        gy_img = cv2.Sobel(face_u8, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx**2 + gy_img**2)
+        for py in range(0, 112 - 15, 28):
+            for px in range(0, 112 - 15, 28):
+                patch = grad_mag[py:py+28, px:px+28]
+                features.append(float(patch.mean()) / 255.0)
+                features.append(float(patch.std()) / 128.0)  # 32
+
+        # Symmetry: left-right face symmetry (unique per person)
+        left_half = face_gray[:, :56]
+        right_half = cv2.flip(face_gray[:, 56:], 1)
+        if left_half.shape == right_half.shape:
+            symmetry = float(np.corrcoef(left_half.flatten(), right_half.flatten())[0, 1])
+        else:
+            symmetry = 0.5
+        features.append(symmetry)  # 1
+
+        # Aspect ratio and proportions
+        if len(faces) > 0:
+            _, _, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            features.append(fw / (fh + 1e-8))  # face aspect ratio
+        else:
+            features.append(0.75)  # default
+        # 1
+
+        # Luminance distribution of face (lighting-invariant skin features)
+        face_lab = cv2.cvtColor(face_crop, cv2.COLOR_BGR2LAB)
+        for ch in range(3):
+            c = face_lab[:, :, ch].astype(np.float32)
+            features.append(c.mean() / 255.0)
+            features.append(c.std() / 128.0)
+            # Skewness (captures asymmetry of skin tone distribution)
+            m = c.mean()
+            s = c.std() + 1e-8
+            features.append(float(((c - m) ** 3).mean() / s**3))  # 9
+
+        # Total: 36 + 24 + 24 + 49 + 32 + 1 + 1 + 9 = 176
+        all_features.append(features)
+
+    if not all_features:
+        logger.warning("  No faces detected in any images, falling back to style features")
+        return _extract_concept_signature(images)
+
+    logger.info(f"  OpenCV face features: {len(all_features)} faces ({len(all_features[0])}-dim)")
+    return torch.tensor(all_features, dtype=torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # LoRA Construction from Concept Directions
 # ---------------------------------------------------------------------------
@@ -231,7 +388,10 @@ class LoRAForge:
         strength: Global strength multiplier for the LoRA (default: 1.0)
         min_r_squared: Minimum R^2 to include a layer (default: 0.01)
         use_vision_model: Try DINOv2 for features (default: False, uses OpenCV)
+        mode: "style" (default) for visual style, "character" for face identity
     """
+
+    MODES = ("style", "character")
 
     def __init__(
         self,
@@ -239,9 +399,13 @@ class LoRAForge:
         strength: float = 1.0,
         min_r_squared: float = 0.01,
         use_vision_model: bool = False,
+        mode: str = "style",
     ):
+        if mode not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}, got '{mode}'")
         self.rank = rank
         self.strength = strength
+        self.mode = mode
         self.min_r2 = min_r_squared
         self.use_vision_model = use_vision_model
 
@@ -293,10 +457,13 @@ class LoRAForge:
         t0 = time.time()
 
         # ── Phase 1: Extract concept signature ──────────────────────────
-        logger.info("Phase 1: Extracting concept signature from dataset...")
+        mode_label = "character identity" if self.mode == "character" else "visual style"
+        logger.info(f"Phase 1: Extracting {mode_label} signature from dataset...")
         images = _load_images(image_dir, max_images, target_h, target_w)
 
-        if self.use_vision_model:
+        if self.mode == "character":
+            concept_features = _extract_character_signature(images)
+        elif self.use_vision_model:
             concept_features = _extract_concept_signature_with_model(images, device)
         else:
             concept_features = _extract_concept_signature(images)

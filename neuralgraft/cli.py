@@ -393,14 +393,18 @@ def cmd_forge(args):
     output = Path(args.output)
     device = args.device or _default_device()
 
+    mode = getattr(args, "mode", "style")
+
     _banner("NeuralGraft -- LoRA Forge (Zero-Training LoRA Construction)", {
         "Base model": base.name,
         "Dataset": str(image_dir),
         "Output": output.name,
+        "Mode": mode,
         "Rank": str(args.rank),
         "Strength": f"{args.strength}x",
         "Device": device,
-        "Vision model": "DINOv2" if args.use_vision_model else "OpenCV (lightweight)",
+        "Features": "InsightFace/ArcFace" if mode == "character" else
+                    ("DINOv2" if args.use_vision_model else "OpenCV (lightweight)"),
     })
 
     t0 = time.time()
@@ -410,6 +414,7 @@ def cmd_forge(args):
         strength=args.strength,
         min_r_squared=args.min_r2,
         use_vision_model=args.use_vision_model,
+        mode=mode,
     )
 
     result = forge.forge(
@@ -505,6 +510,9 @@ def main():
                          help="Use DINOv2 for richer features (requires internet on first run)")
     p_forge.add_argument("--min-r2", type=float, default=0.01,
                          help="Minimum R^2 to include a layer (default: 0.01)")
+    p_forge.add_argument("--mode", type=str, default="style",
+                         choices=["style", "character"],
+                         help="'style' for visual style/texture, 'character' for face identity (default: style)")
 
     # List codecs
     sub.add_parser("list", help="List available codecs")
