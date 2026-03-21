@@ -211,20 +211,36 @@ def _extract_concept_signature_with_model(
         return _extract_concept_signature(images)
 
 
-def _extract_character_signature(images: List[np.ndarray]) -> torch.Tensor:
+def _extract_character_signature(
+    images: List[np.ndarray],
+) -> Tuple[torch.Tensor, List[int]]:
     """
-    Extract identity-focused features for character LoRAs.
+    Extract full-body character features for character LoRAs.
 
-    Uses InsightFace/ArcFace (512-dim identity embedding) if available,
-    with OpenCV face-crop features as fallback.
+    Captures the COMPLETE character appearance:
+      - Face identity (InsightFace ArcFace 512-dim if available)
+      - Full-body style features (color palette, texture, proportions)
 
-    The key difference from style signatures: these features encode WHO
-    is in the image (facial geometry, skin tone, face structure) rather
-    than how the image looks stylistically.
+    When a face is detected, features are identity-focused.
+    When no face is found, full-body features still capture the character's
+    overall appearance (outfit colors, body proportions, background style).
 
-    Returns: [N_images, d_features] feature matrix
+    Returns:
+        (features, valid_indices): feature matrix [N_valid, d_feat] and
+        list of image indices that produced valid features (for alignment
+        with activation proxies).
     """
-    # ── Try InsightFace (gold standard for identity) ──
+    n_images = len(images)
+
+    # ── Phase A: Full-body style features for ALL images ──
+    # These capture outfit, proportions, color palette — always available
+    body_features = _extract_concept_signature(images)  # [N, 81]
+
+    # ── Phase B: Face identity features (optional, stacked with body) ──
+    face_features = None
+    valid_face_indices = list(range(n_images))  # default: all images
+
+    # Try InsightFace (gold standard for face identity)
     try:
         from insightface.app import FaceAnalysis
 
@@ -232,137 +248,42 @@ def _extract_character_signature(images: List[np.ndarray]) -> torch.Tensor:
         app.prepare(ctx_id=-1, det_size=(640, 640))
 
         embeddings = []
-        skipped = 0
-        for img in images:
+        face_indices = []
+        for i, img in enumerate(images):
             faces = app.get(img)
             if faces:
-                # Use the largest face (most prominent)
                 largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
                 embeddings.append(torch.from_numpy(largest.embedding).float())
-            else:
-                skipped += 1
+                face_indices.append(i)
 
         del app
 
         if len(embeddings) >= 3:
-            if skipped > 0:
-                logger.info(f"  InsightFace: {len(embeddings)} faces detected, {skipped} images had no face")
-            else:
-                logger.info(f"  InsightFace: {len(embeddings)} face embeddings (512-dim)")
-            return torch.stack(embeddings)
+            face_features = torch.stack(embeddings)  # [N_faces, 512]
+            valid_face_indices = face_indices
+            logger.info(f"  InsightFace: {len(embeddings)}/{n_images} faces (512-dim)")
         else:
-            logger.info(f"  InsightFace: only {len(embeddings)} faces found, falling back to OpenCV")
+            logger.info(f"  InsightFace: only {len(embeddings)} faces, using full-body only")
 
     except ImportError:
-        logger.info("  InsightFace not installed, using OpenCV face features")
+        logger.info("  InsightFace not installed, using full-body features")
     except Exception as e:
-        logger.info(f"  InsightFace failed ({e}), using OpenCV face features")
+        logger.info(f"  InsightFace failed ({e}), using full-body features")
 
-    # ── Fallback: OpenCV face-crop features ──
-    # Detect faces, crop, extract identity-focused features from the face region
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+    # ── Combine: face identity (when available) + full-body features (always) ──
+    # This captures the COMPLETE character: face, outfit, body, colors, everything.
 
-    all_features = []
-    for img in images:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
-
-        if len(faces) == 0:
-            # Use center crop as face proxy (portrait assumption)
-            h, w = img.shape[:2]
-            cx, cy = w // 2, h // 3  # Face is typically in upper third
-            sz = min(h, w) // 3
-            x1 = max(0, cx - sz)
-            y1 = max(0, cy - sz)
-            x2 = min(w, cx + sz)
-            y2 = min(h, cy + sz)
-        else:
-            # Largest face
-            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-            # Expand bbox by 30% for context (hair, jawline)
-            pad_x, pad_y = int(fw * 0.3), int(fh * 0.3)
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(img.shape[1], x + fw + pad_x)
-            y2 = min(img.shape[0], y + fh + pad_y)
-
-        face_crop = img[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            continue
-
-        face_crop = cv2.resize(face_crop, (112, 112))
-        features = []
-
-        # Skin tone: HSV histogram of face (captures skin color precisely)
-        hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
-        h_hist = cv2.calcHist([hsv], [0], None, [36], [0, 180]).flatten()
-        s_hist = cv2.calcHist([hsv], [1], None, [24], [0, 256]).flatten()
-        v_hist = cv2.calcHist([hsv], [2], None, [24], [0, 256]).flatten()
-        h_hist = h_hist / (h_hist.sum() + 1e-8)
-        s_hist = s_hist / (s_hist.sum() + 1e-8)
-        v_hist = v_hist / (v_hist.sum() + 1e-8)
-        features.extend(h_hist.tolist())  # 36
-        features.extend(s_hist.tolist())  # 24
-        features.extend(v_hist.tolist())  # 24
-
-        # Face structure: edge map captures jawline, eye shape, nose bridge
-        face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        edges = cv2.Canny(face_gray.astype(np.uint8), 50, 150)
-        # Divide face into 7x7 grid, compute edge density per cell
-        cell_h, cell_w = 112 // 7, 112 // 7
-        for gy in range(7):
-            for gx in range(7):
-                cell = edges[gy*cell_h:(gy+1)*cell_h, gx*cell_w:(gx+1)*cell_w]
-                features.append(np.count_nonzero(cell) / cell.size)  # 49
-
-        # Face texture: LBP-like local patterns (skin texture, wrinkles, pores)
-        face_u8 = face_gray.clip(0, 255).astype(np.uint8)
-        # Compute gradient magnitude in 4x4 patches
-        gx = cv2.Sobel(face_u8, cv2.CV_32F, 1, 0, ksize=3)
-        gy_img = cv2.Sobel(face_u8, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(gx**2 + gy_img**2)
-        for py in range(0, 112 - 15, 28):
-            for px in range(0, 112 - 15, 28):
-                patch = grad_mag[py:py+28, px:px+28]
-                features.append(float(patch.mean()) / 255.0)
-                features.append(float(patch.std()) / 128.0)  # 32
-
-        # Symmetry: left-right face symmetry (unique per person)
-        left_half = face_gray[:, :56]
-        right_half = cv2.flip(face_gray[:, 56:], 1)
-        if left_half.shape == right_half.shape:
-            symmetry = float(np.corrcoef(left_half.flatten(), right_half.flatten())[0, 1])
-        else:
-            symmetry = 0.5
-        features.append(symmetry)  # 1
-
-        # Aspect ratio and proportions
-        if len(faces) > 0:
-            _, _, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-            features.append(fw / (fh + 1e-8))  # face aspect ratio
-        else:
-            features.append(0.75)  # default
-        # 1
-
-        # Luminance distribution of face (lighting-invariant skin features)
-        face_lab = cv2.cvtColor(face_crop, cv2.COLOR_BGR2LAB)
-        for ch in range(3):
-            c = face_lab[:, :, ch].astype(np.float32)
-            features.append(c.mean() / 255.0)
-            features.append(c.std() / 128.0)
-            # Skewness (captures asymmetry of skin tone distribution)
-            m = c.mean()
-            s = c.std() + 1e-8
-            features.append(float(((c - m) ** 3).mean() / s**3))  # 9
-
-        # Total: 36 + 24 + 24 + 49 + 32 + 1 + 1 + 9 = 176
-        all_features.append(features)
-
-    if not all_features:
-        logger.warning("  No faces detected in any images, falling back to style features")
-        return _extract_concept_signature(images)
+    if face_features is not None:
+        # Filter body features to match only images where faces were found
+        body_aligned = body_features[valid_face_indices]  # [N_faces, 81]
+        # Concatenate: [N_faces, 512 + 81] = [N_faces, 593]
+        combined = torch.cat([face_features, body_aligned], dim=1)
+        logger.info(f"  Combined features: {combined.shape[1]}-dim (512 face + 81 body)")
+        return combined, valid_face_indices
+    else:
+        # No face encoder available — use full-body features for ALL images
+        logger.info(f"  Full-body features: {body_features.shape[1]}-dim (all {n_images} images)")
+        return body_features, list(range(n_images))
 
     logger.info(f"  OpenCV face features: {len(all_features)} faces ({len(all_features[0])}-dim)")
     return torch.tensor(all_features, dtype=torch.float32)
@@ -461,8 +382,13 @@ class LoRAForge:
         logger.info(f"Phase 1: Extracting {mode_label} signature from dataset...")
         images = _load_images(image_dir, max_images, target_h, target_w)
 
+        # valid_indices tracks which images produced features (some may be
+        # skipped if InsightFace can't find a face). The activation proxy
+        # must be filtered to match.
+        valid_indices = None
+
         if self.mode == "character":
-            concept_features = _extract_character_signature(images)
+            concept_features, valid_indices = _extract_character_signature(images)
         elif self.use_vision_model:
             concept_features = _extract_concept_signature_with_model(images, device)
         else:
@@ -522,6 +448,13 @@ class LoRAForge:
             t = torch.from_numpy(rgb_small).float().permute(2, 0, 1).flatten() / 255.0
             image_tensors.append(t)
         image_flat = torch.stack(image_tensors)  # [N, 3*64*48] = [N, 9216]
+
+        # Filter image_flat to match valid_indices from feature extraction
+        # (character mode may skip images where no face was detected)
+        if valid_indices is not None and len(valid_indices) < len(image_flat):
+            image_flat = image_flat[valid_indices]
+            logger.info(f"  Aligned activation proxy to {len(valid_indices)} images with features")
+
         frame_dim = image_flat.shape[1]
 
         # ── Phase 3: Activation regression per layer ────────────────────
@@ -620,11 +553,15 @@ class LoRAForge:
 
                 # ── Convert key format: model weight key → LoRA key ──
                 # ComfyUI expects: diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight
+                # Strip ALL wrapper prefixes, then add diffusion_model.
                 lora_base = out_key.replace(".weight", "")
-                if lora_base.startswith("model.") and not lora_base.startswith("model.diffusion_model."):
-                    lora_base = lora_base[len("model."):]
-                if not lora_base.startswith("diffusion_model."):
-                    lora_base = "diffusion_model." + lora_base
+                # Strip known wrapper prefixes
+                for prefix in ["model.diffusion_model.", "model.", "diffusion_model."]:
+                    if lora_base.startswith(prefix):
+                        lora_base = lora_base[len(prefix):]
+                        break
+                # Always add the canonical prefix
+                lora_base = "diffusion_model." + lora_base
 
                 lora_state_dict[f"{lora_base}.lora_A.weight"] = A.to(torch.bfloat16).contiguous()
                 lora_state_dict[f"{lora_base}.lora_B.weight"] = B.to(torch.bfloat16).contiguous()
