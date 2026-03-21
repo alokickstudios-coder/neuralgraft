@@ -344,13 +344,17 @@ class LoRAForge:
         layer_names = sorted(layer_names_set, key=_sort_key)
         logger.info(f"  Found {len(layer_names)} transformer blocks")
 
-        # Create image content vectors (flatten and project)
+        # Create image content vectors (downsample to manageable size first)
+        # Full resolution (3*640*384 = 737K dims) creates a 737K x d_in projection
+        # matrix that OOMs on most machines. Downsample to 64x48 = ~9K dims instead.
+        PROXY_H, PROXY_W = 64, 48
         image_tensors = []
         for img in images:
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            t = torch.from_numpy(rgb).float().permute(2, 0, 1).flatten() / 255.0
+            rgb_small = cv2.resize(rgb, (PROXY_W, PROXY_H))
+            t = torch.from_numpy(rgb_small).float().permute(2, 0, 1).flatten() / 255.0
             image_tensors.append(t)
-        image_flat = torch.stack(image_tensors)  # [N, C*H*W]
+        image_flat = torch.stack(image_tensors)  # [N, 3*64*48] = [N, 9216]
         frame_dim = image_flat.shape[1]
 
         # ── Phase 3: Activation regression per layer ────────────────────
@@ -391,6 +395,7 @@ class LoRAForge:
                 d_out, d_in = W.shape
 
                 # Create activation proxy: project image content through W
+                # Projection matrix: [9216, d_in] ≈ 150 MB for d_in=4096 (vs 24 GB before)
                 if d_in not in proj_cache:
                     gen = torch.Generator().manual_seed(42 + d_in)
                     proj = torch.randn(frame_dim, d_in, generator=gen)
