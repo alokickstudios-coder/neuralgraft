@@ -464,13 +464,14 @@ class LoRAForge:
             A = A.clamp(-max_val, max_val)
 
             # ── Convert key format: model weight key → LoRA key ──
-            # "model.transformer_blocks.0.attn1.to_out.0.weight"
-            # → "transformer_blocks.0.attn1.to_out.0.lora_A.weight"
-            lora_base = out_key
-            for prefix in ["model.", "diffusion_model."]:
-                if lora_base.startswith(prefix):
-                    lora_base = lora_base[len(prefix):]
-            lora_base = lora_base.replace(".weight", "")
+            # ComfyUI expects: "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_A.weight"
+            # Strip only "model." prefix but KEEP "diffusion_model." prefix.
+            # If no prefix exists, ADD "diffusion_model." for ComfyUI compatibility.
+            lora_base = out_key.replace(".weight", "")
+            if lora_base.startswith("model.") and not lora_base.startswith("model.diffusion_model."):
+                lora_base = lora_base[len("model."):]
+            if not lora_base.startswith("diffusion_model."):
+                lora_base = "diffusion_model." + lora_base
 
             lora_state_dict[f"{lora_base}.lora_A.weight"] = A.to(torch.float16).contiguous()
             lora_state_dict[f"{lora_base}.lora_B.weight"] = B.to(torch.float16).contiguous()

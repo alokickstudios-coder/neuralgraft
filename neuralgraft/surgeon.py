@@ -192,9 +192,18 @@ class WeightSurgeon:
             base_key_set = set(state_dict.keys())
 
             def _find_target(lora_base_key: str) -> Optional[str]:
+                # Try multiple prefix conventions to match LoRA key → model key
+                stripped = lora_base_key.rstrip(".")
+                # Also try stripping diffusion_model. prefix (ComfyUI LoRA format)
+                stripped_no_dm = stripped
+                if stripped_no_dm.startswith("diffusion_model."):
+                    stripped_no_dm = stripped_no_dm[len("diffusion_model."):]
                 candidates = [
-                    lora_base_key.rstrip(".") + ".weight",
-                    "model." + lora_base_key.rstrip(".") + ".weight",
+                    stripped + ".weight",
+                    "model." + stripped + ".weight",
+                    "diffusion_model." + stripped + ".weight",
+                    stripped_no_dm + ".weight",
+                    "model." + stripped_no_dm + ".weight",
                 ]
                 for c in candidates:
                     if c in base_key_set:
